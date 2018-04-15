@@ -17,8 +17,10 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 
 	"github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/gomatrix"
 
 	"github.com/lib/pq"
 	"github.com/matrix-org/dendrite/common"
@@ -41,6 +43,12 @@ CREATE TABLE IF NOT EXISTS syncapi_output_room_events (
     event_id TEXT NOT NULL,
     -- The 'room_id' key for the event.
     room_id TEXT NOT NULL,
+    -- The 'type' property for the event.
+    type TEXT NOT NULL,
+    -- The 'sender' property for the event.
+    sender TEXT NOT NULL,
+	-- true if the event content contains a url key
+    contains_url BOOL NOT NULL,
     -- The JSON for the event. Stored as TEXT because this should be valid UTF-8.
     event_json TEXT NOT NULL,
     -- A list of event IDs which represent a delta of added/removed room state. This can be NULL
@@ -51,21 +59,32 @@ CREATE TABLE IF NOT EXISTS syncapi_output_room_events (
     transaction_id TEXT  -- The transaction id used to send the event, if any
 );
 -- for event selection
-CREATE UNIQUE INDEX IF NOT EXISTS syncapi_event_id_idx ON syncapi_output_room_events(event_id);
+CREATE UNIQUE INDEX IF NOT EXISTS syncapi_event_id_idx ON syncapi_output_room_events(
+	event_id,
+	room_id,
+	type,
+	sender,
+	contains_url);
 `
 
 const insertEventSQL = "" +
 	"INSERT INTO syncapi_output_room_events (" +
-	" room_id, event_id, event_json, add_state_ids, remove_state_ids, device_id, transaction_id" +
-	") VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id"
+	" room_id, event_id, type, sender, contains_url, event_json, add_state_ids, remove_state_ids, device_id, transaction_id" +
+	") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id"
 
 const selectEventsSQL = "" +
 	"SELECT id, event_json FROM syncapi_output_room_events WHERE event_id = ANY($1)"
 
 const selectRecentEventsSQL = "" +
 	"SELECT id, event_json, device_id, transaction_id FROM syncapi_output_room_events" +
-	" WHERE room_id = $1 AND id > $2 AND id <= $3" +
-	" ORDER BY id ASC LIMIT $4"
+	" WHERE room_id=$1 " +
+	" AND id > $2 AND id <= $3" +
+	" AND ( $4::text[] IS NULL OR     sender  = ANY($4)  )" +
+	" AND ( $5::text[] IS NULL OR NOT(sender  = ANY($5)) )" +
+	" AND ( $6::text[] IS NULL OR     type LIKE ANY($6)  )" +
+	" AND ( $7::text[] IS NULL OR NOT(type LIKE ANY($7)) )" +
+	" AND ( $8::bool IS NULL   OR     contains_url = $8  )" +
+	" ORDER BY id DESC LIMIT $9"
 
 const selectMaxEventIDSQL = "" +
 	"SELECT MAX(id) FROM syncapi_output_room_events"
@@ -205,11 +224,22 @@ func (s *outputRoomEventsStatements) insertEvent(
 		txnID = &transactionID.TransactionID
 	}
 
+	// Parse content as JSON and search for an "url" key
+	containsURL := false
+	var content map[string]interface{}
+	if json.Unmarshal(event.Content(), &content) != nil {
+		// Set containsURL = true if url is present
+		_, containsURL = content["url"]
+	}
+
 	stmt := common.TxStmt(txn, s.insertEventStmt)
 	err = stmt.QueryRowContext(
 		ctx,
 		event.RoomID(),
 		event.EventID(),
+		event.Type(),
+		event.Sender(),
+		containsURL,
 		event.JSON(),
 		pq.StringArray(addState),
 		pq.StringArray(removeState),
@@ -219,13 +249,20 @@ func (s *outputRoomEventsStatements) insertEvent(
 	return
 }
 
-// RecentEventsInRoom returns the most recent events in the given room, up to a maximum of 'limit'.
+// RecentEventsInRoom returns the most recent events in the given room, up to a maximum defined in the FilterPart.
 func (s *outputRoomEventsStatements) selectRecentEvents(
 	ctx context.Context, txn *sql.Tx,
-	roomID string, fromPos, toPos types.StreamPosition, limit int,
+	roomID string, fromPos, toPos types.StreamPosition, timelineFilterPart *gomatrix.FilterPart,
 ) ([]streamEvent, error) {
 	stmt := common.TxStmt(txn, s.selectRecentEventsStmt)
-	rows, err := stmt.QueryContext(ctx, roomID, fromPos, toPos, limit)
+	rows, err := stmt.QueryContext(ctx, roomID, fromPos, toPos,
+		pq.StringArray(timelineFilterPart.Senders),
+		pq.StringArray(timelineFilterPart.NotSenders),
+		pq.StringArray(filterConvertTypeWildcardToSQL(timelineFilterPart.Types)),
+		pq.StringArray(filterConvertTypeWildcardToSQL(timelineFilterPart.NotTypes)),
+		timelineFilterPart.ContainsURL,
+		timelineFilterPart.Limit, // TODO: limit abusive values? This can also be done in CompleteSync / IncrementalSync
+	)
 	if err != nil {
 		return nil, err
 	}

@@ -23,6 +23,7 @@ import (
 
 	"github.com/matrix-org/dendrite/clientapi/auth/authtypes"
 	"github.com/matrix-org/dendrite/roomserver/api"
+	"github.com/matrix-org/gomatrix"
 	// Import the postgres database driver.
 	_ "github.com/lib/pq"
 	"github.com/matrix-org/dendrite/common"
@@ -242,9 +243,10 @@ func (d *SyncServerDatabase) IncrementalSync(
 		return nil, err
 	}
 
+	filter := gomatrix.DefaultFilter() // TODO: use filter provided in request
 	res := types.NewResponse(toPos)
 	for _, delta := range deltas {
-		err = d.addRoomDeltaToResponse(ctx, &device, txn, fromPos, toPos, delta, numRecentEventsPerRoom, res)
+		err = d.addRoomDeltaToResponse(ctx, &device, txn, fromPos, toPos, delta, &filter, res)
 		if err != nil {
 			return nil, err
 		}
@@ -297,8 +299,9 @@ func (d *SyncServerDatabase) CompleteSync(
 		// TODO: When filters are added, we may need to call this multiple times to get enough events.
 		//       See: https://github.com/matrix-org/synapse/blob/v0.19.3/synapse/handlers/sync.py#L316
 		var recentStreamEvents []streamEvent
+		timelineFilterPart := gomatrix.DefaultFilterPart() // TODO: use filter provided in request
 		recentStreamEvents, err = d.events.selectRecentEvents(
-			ctx, txn, roomID, types.StreamPosition(0), pos, numRecentEventsPerRoom,
+			ctx, txn, roomID, types.StreamPosition(0), pos, &timelineFilterPart,
 		)
 		if err != nil {
 			return nil, err
@@ -409,7 +412,7 @@ func (d *SyncServerDatabase) addRoomDeltaToResponse(
 	txn *sql.Tx,
 	fromPos, toPos types.StreamPosition,
 	delta stateDelta,
-	numRecentEventsPerRoom int,
+	filter *gomatrix.Filter,
 	res *types.Response,
 ) error {
 	endPos := toPos
@@ -422,8 +425,9 @@ func (d *SyncServerDatabase) addRoomDeltaToResponse(
 		// This is all "okay" assuming history_visibility == "shared" which it is by default.
 		endPos = delta.membershipPos
 	}
+
 	recentStreamEvents, err := d.events.selectRecentEvents(
-		ctx, txn, delta.roomID, fromPos, endPos, numRecentEventsPerRoom,
+		ctx, txn, delta.roomID, fromPos, endPos, &filter.Room.Timeline,
 	)
 	if err != nil {
 		return err
